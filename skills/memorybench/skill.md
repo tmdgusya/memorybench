@@ -1,3 +1,8 @@
+---
+name: benchmark-context
+description: "Automatically benchmark your custom memory implementation against established systems like Supermemory. Set up a public benchmark, or create your own. Compare solutions against quality, latency, features and cost, easily, with a simple UI and CLI."
+---
+
 # MemoryBench Integration Skill
 
 Automatically benchmark your custom memory implementation against established systems like Supermemory, Mem0, and Zep.
