@@ -200,7 +200,17 @@ export class MemoryDecayProvider implements Provider {
         signal: AbortSignal.timeout(30000),
       })
       if (!res.ok) return []
-      const data = (await res.json()) as { results: unknown[] }
+      const data = (await res.json()) as { results: Array<{ text: string; score: number }> }
+
+      // Log token efficiency
+      const totalChars = data.results.reduce((sum, r) => sum + (r.text?.length || 0), 0)
+      const estTokens = Math.ceil(totalChars / 4)
+      logger.debug(
+        `[memory-decay] Search for "${query.substring(0, 40)}...": ` +
+          `${data.results.length} results, ~${estTokens} context tokens ` +
+          `(from ${cached.messages.length} total memories)`
+      )
+
       return data.results
     } catch {
       return []
