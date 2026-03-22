@@ -13,6 +13,18 @@ import { memoryDecayPrompts } from "./prompts"
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
+interface CachedMessage {
+  text: string
+  importance: number
+  created_tick: number
+  sessionDateMs: number
+}
+
+interface CachedQuestion {
+  messages: CachedMessage[]
+  sessionDatesMs: number[]
+}
+
 /**
  * Memory Decay Provider
  *
@@ -20,16 +32,18 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000
  * The server implements decay-based memory retrieval using a NetworkX
  * graph with activation scores that decay over simulated time.
  *
- * Each question runs in isolation: reset → ingest → simulate decay → search.
- * Session dates are mapped to ticks (1 tick = 1 day) so older memories
- * decay more than recent ones.
+ * MemoryBench batches phases (all ingests, then all searches), but our
+ * server has a single graph. To handle per-question isolation, we cache
+ * ingest data locally during ingest() and replay reset → store → tick
+ * at search() time. The server's embedding cache ensures re-ingestion
+ * of previously seen texts is fast (no duplicate API calls).
  */
 export class MemoryDecayProvider implements Provider {
   name = "memory-decay"
   prompts: ProviderPrompts = memoryDecayPrompts
 
   private baseUrl = "http://localhost:8100"
-  private simulateTicks = 0
+  private cache = new Map<string, CachedQuestion>()
 
   async initialize(config: ProviderConfig): Promise<void> {
     if (config.baseUrl) {
@@ -58,78 +72,44 @@ export class MemoryDecayProvider implements Provider {
     sessions: UnifiedSession[],
     options: IngestOptions
   ): Promise<IngestResult> {
-    // Reset graph for per-question isolation
-    await fetch(`${this.baseUrl}/reset`, { method: "POST" })
+    // Cache locally — actual server ingest happens in search() to handle
+    // MemoryBench's batched phase execution.
+    // NOTE: The orchestrator calls ingest() once per session (not per question),
+    // so we ACCUMULATE messages across calls with the same containerTag.
 
-    // Compute date-to-tick mapping
-    const sessionDates = this.extractSessionDates(sessions)
-    const earliestMs = Math.min(...sessionDates.map((d) => d.getTime()))
-
-    // Compute target ticks for simulation from question metadata
-    const questionDate = this.extractQuestionDate(options)
-    if (questionDate) {
-      this.simulateTicks = Math.max(
-        1,
-        Math.floor((questionDate.getTime() - earliestMs) / ONE_DAY_MS)
-      )
-    } else {
-      // Fallback: latest session date + 30 days
-      const latestMs = Math.max(...sessionDates.map((d) => d.getTime()))
-      this.simulateTicks = Math.max(
-        1,
-        Math.floor((latestMs - earliestMs) / ONE_DAY_MS) + 30
-      )
+    const existing = this.cache.get(options.containerTag) || {
+      messages: [],
+      sessionDatesMs: [] as number[],
     }
 
-    // Ingest each message as a memory
-    const documentIds: string[] = []
-    let stored = 0
-    let skipped = 0
+    const sessionDates = this.extractSessionDates(sessions)
 
+    // Accumulate messages with their session dates
     for (let si = 0; si < sessions.length; si++) {
       const session = sessions[si]
-      const sessionDate = sessionDates[si]
-      const createdTick = Math.floor(
-        (sessionDate.getTime() - earliestMs) / ONE_DAY_MS
-      )
+      const sessionDateMs = sessionDates[si].getTime()
+      existing.sessionDatesMs.push(sessionDateMs)
 
       for (const msg of session.messages) {
         const importance = msg.role === "user" ? 0.7 : 0.4
         const prefix = msg.role === "user" ? "[User]" : "[Assistant]"
-        const text = `${prefix} ${msg.content}`
-
-        try {
-          const res = await fetch(`${this.baseUrl}/store`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              text,
-              importance,
-              mtype: "episode",
-              created_tick: createdTick,
-            }),
-            signal: AbortSignal.timeout(30000),
-          })
-          if (res.ok) {
-            const data = (await res.json()) as { id: string }
-            documentIds.push(data.id)
-            stored++
-          } else {
-            logger.warn(
-              `[memory-decay] /store failed for session ${session.sessionId}: ${res.status}`
-            )
-            skipped++
-          }
-        } catch (e) {
-          logger.warn(`[memory-decay] /store error: ${e}`)
-          skipped++
-        }
+        existing.messages.push({
+          text: `${prefix} ${msg.content}`,
+          importance,
+          created_tick: 0, // will be recomputed in finalizeCache()
+          sessionDateMs,
+        })
       }
     }
 
+    this.cache.set(options.containerTag, existing)
+
+    const documentIds = existing.messages.map(
+      (_, i) => `${options.containerTag}_${i}`
+    )
+
     logger.debug(
-      `Ingested ${stored} memories (${skipped} skipped) across ${sessions.length} sessions, ` +
-        `will simulate ${this.simulateTicks} ticks`
+      `Cached ${existing.messages.length} messages (${sessions.length} new sessions) for ${options.containerTag}`
     )
 
     return { documentIds }
@@ -140,9 +120,66 @@ export class MemoryDecayProvider implements Provider {
     _containerTag: string,
     onProgress?: IndexingProgressCallback
   ): Promise<void> {
-    // Run decay simulation to the question date.
-    // Server caps /tick at 1000, so loop for large ranges.
-    let remaining = this.simulateTicks
+    // No-op — actual simulation happens in search()
+    onProgress?.({
+      completedIds: result.documentIds,
+      failedIds: [],
+      total: result.documentIds.length,
+    })
+  }
+
+  async search(query: string, options: SearchOptions): Promise<unknown[]> {
+    const cached = this.cache.get(options.containerTag)
+    if (!cached || cached.messages.length === 0) return []
+
+    // Compute tick mapping from all accumulated session dates
+    const allDatesMs = cached.sessionDatesMs.filter((d) => d > 0)
+    const earliestMs =
+      allDatesMs.length > 0 ? Math.min(...allDatesMs) : 0
+    const latestMs =
+      allDatesMs.length > 0 ? Math.max(...allDatesMs) : 0
+
+    // Assign created_tick based on relative dates
+    for (const msg of cached.messages) {
+      if (msg.sessionDateMs > 0 && earliestMs > 0) {
+        msg.created_tick = Math.floor(
+          (msg.sessionDateMs - earliestMs) / ONE_DAY_MS
+        )
+      } else {
+        msg.created_tick = 0
+      }
+    }
+
+    // Simulate ticks: latest session date + 30 days
+    const simulateTicks =
+      earliestMs > 0
+        ? Math.max(1, Math.floor((latestMs - earliestMs) / ONE_DAY_MS) + 30)
+        : 30
+
+    // Reset → ingest → simulate → search (per-question isolation)
+    await fetch(`${this.baseUrl}/reset`, { method: "POST" })
+
+    // Ingest all cached messages
+    for (const msg of cached.messages) {
+      try {
+        await fetch(`${this.baseUrl}/store`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            text: msg.text,
+            importance: msg.importance,
+            mtype: "episode",
+            created_tick: msg.created_tick,
+          }),
+          signal: AbortSignal.timeout(30000),
+        })
+      } catch (e) {
+        logger.warn(`[memory-decay] /store error during search: ${e}`)
+      }
+    }
+
+    // Run decay simulation
+    let remaining = simulateTicks
     while (remaining > 0) {
       const batch = Math.min(remaining, 1000)
       await fetch(`${this.baseUrl}/tick`, {
@@ -154,14 +191,7 @@ export class MemoryDecayProvider implements Provider {
       remaining -= batch
     }
 
-    onProgress?.({
-      completedIds: result.documentIds,
-      failedIds: [],
-      total: result.documentIds.length,
-    })
-  }
-
-  async search(query: string, options: SearchOptions): Promise<unknown[]> {
+    // Search
     try {
       const res = await fetch(`${this.baseUrl}/search`, {
         method: "POST",
@@ -177,8 +207,8 @@ export class MemoryDecayProvider implements Provider {
     }
   }
 
-  async clear(_containerTag: string): Promise<void> {
-    await fetch(`${this.baseUrl}/reset`, { method: "POST" })
+  async clear(containerTag: string): Promise<void> {
+    this.cache.delete(containerTag)
   }
 
   // --- Private helpers ---
@@ -187,7 +217,6 @@ export class MemoryDecayProvider implements Provider {
     return sessions.map((session) => {
       const meta = session.metadata || {}
 
-      // Try ISO date from metadata
       const dateStr = (meta.date || meta.formattedDate || meta.iso_date) as
         | string
         | undefined
@@ -196,28 +225,15 @@ export class MemoryDecayProvider implements Provider {
         if (!isNaN(parsed.getTime())) return parsed
       }
 
-      // Try first message timestamp
       if (session.messages.length > 0 && session.messages[0].timestamp) {
         const parsed = new Date(session.messages[0].timestamp)
         if (!isNaN(parsed.getTime())) return parsed
       }
 
-      // Fallback to epoch
       return new Date(0)
     })
   }
 
-  private extractQuestionDate(options: IngestOptions): Date | null {
-    const meta = options.metadata || {}
-    const dateStr = (meta.questionDate || meta.question_date) as
-      | string
-      | undefined
-    if (dateStr) {
-      const parsed = new Date(dateStr)
-      if (!isNaN(parsed.getTime())) return parsed
-    }
-    return null
-  }
 }
 
 export default MemoryDecayProvider
