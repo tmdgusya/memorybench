@@ -30,6 +30,8 @@ export function getProviderConfig(provider: string): { apiKey: string; baseUrl?:
       return { apiKey: config.openaiApiKey } // Filesystem uses OpenAI for memory extraction
     case "rag":
       return { apiKey: config.openaiApiKey } // RAG provider uses OpenAI for embeddings
+    case "memory-decay":
+      return { apiKey: "", baseUrl: process.env.MEMORY_DECAY_BASE_URL || "http://localhost:8100" }
     default:
       throw new Error(`Unknown provider: ${provider}`)
   }
