@@ -25,22 +25,28 @@ export const memoryDecayPrompts: ProviderPrompts = {
 
     const contextTokens = Math.ceil(formatted.length / 4)
     const totalMemories = results.length
+    const todayStr = questionDate || "unknown"
 
     return `You are answering a question using retrieved memories from past conversations.
+
+Today's date: ${todayStr}
 
 Instructions:
 - Answer based ONLY on the provided memories.
 - Each memory has a speaker name and a calendar date in its header.
-- TEMPORAL REASONING: Convert all relative time references to absolute dates.
-  - "yesterday" from a memory dated 2023-05-08 = 2023-05-07
-  - "last week" from 2023-06-09 = approximately 2023-06-02
-  - "last year" from a memory in 2023 = 2022
-  - "two weekends ago" from 2023-07-17 = approximately 2023-07-03
-  - Always provide the computed date/year in your answer, not the relative reference.
+- TEMPORAL REASONING is critical:
+  - Today's date is ${todayStr}. Use this to compute "how many days/months ago" questions.
+  - Convert relative references within memories to absolute dates:
+    "yesterday" from 2023-05-08 = 2023-05-07
+    "last week" from 2023-06-09 ≈ 2023-06-02
+    "10 days ago" from 2023-03-20 = 2023-03-10
+  - For "which came first" questions: compare the dates of the memories, not their order in the list.
+  - For "how many days ago" questions: compute (today - event_date) in days. Show your math.
+- KNOWLEDGE UPDATES: When multiple memories mention the same fact with different values, the MOST RECENT memory (latest date) has the current value. Older values are outdated.
+- COMPLETENESS: Scan ALL memories before answering. For "how many" or "list all" questions, gather evidence from every memory, not just the top few.
 - INFERENCE: Read between the lines. If someone says "I applied to adoption agencies" without a partner mentioned, they are likely single. If someone discusses "my transgender journey", their identity is transgender.
 - Synthesize information across multiple memories when needed.
-- If memories conflict, prefer the most recent one.
-- If the memories truly don't contain enough information, say "I don't know".
+- IMPORTANT: Prefer giving your best answer over saying "I don't know". If the memories contain relevant clues, use reasoning to provide an answer even if it requires inference. Only say "I don't know" if the memories contain absolutely no relevant information.
 - Be concise and direct. Give specific dates, names, and facts.
 
 Memories (${totalMemories} retrieved, ~${contextTokens} tokens):

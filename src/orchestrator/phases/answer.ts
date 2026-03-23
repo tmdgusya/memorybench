@@ -118,19 +118,27 @@ export async function runAnswerPhase(
         const context: unknown[] = searchData.results || []
         const questionDate = checkpoint.questions[question.questionId]?.questionDate
 
-        const prompt = buildAnswerPrompt(question.question, context, questionDate, provider)
+        let text: string
 
-        const params: Record<string, unknown> = {
-          model: client(modelConfig.id),
-          prompt,
-          maxTokens: modelConfig.defaultMaxTokens,
+        if (provider?.answerFunction) {
+          // Agent-based answer generation (e.g., Claude Code CLI)
+          text = await provider.answerFunction(question.question, context, questionDate)
+        } else {
+          const prompt = buildAnswerPrompt(question.question, context, questionDate, provider)
+
+          const params: Record<string, unknown> = {
+            model: client(modelConfig.id),
+            prompt,
+            maxTokens: modelConfig.defaultMaxTokens,
+          }
+
+          if (modelConfig.supportsTemperature) {
+            params.temperature = modelConfig.defaultTemperature
+          }
+
+          const result = await generateText(params as Parameters<typeof generateText>[0])
+          text = result.text
         }
-
-        if (modelConfig.supportsTemperature) {
-          params.temperature = modelConfig.defaultTemperature
-        }
-
-        const { text } = await generateText(params as Parameters<typeof generateText>[0])
 
         const durationMs = Date.now() - startTime
         checkpointManager.updatePhase(checkpoint, question.questionId, "answer", {

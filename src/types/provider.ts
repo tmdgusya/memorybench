@@ -45,6 +45,17 @@ export interface Provider {
   ): Promise<void>
   search(query: string, options: SearchOptions): Promise<unknown[]>
   clear(containerTag: string): Promise<void>
+
+  /**
+   * Optional custom answer function. When defined, answer.ts calls this
+   * instead of generateText(). Enables agent-based answer generation
+   * (e.g., Claude Code CLI) that can autonomously re-query and reason.
+   */
+  answerFunction?: (
+    question: string,
+    context: unknown[],
+    questionDate?: string
+  ) => Promise<string>
 }
 
 export type ProviderName = "supermemory" | "mem0" | "zep" | "filesystem" | "rag" | "memory-decay"

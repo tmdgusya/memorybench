@@ -10,6 +10,13 @@ import type { ProviderPrompts } from "../../types/prompts"
 import type { UnifiedSession } from "../../types/unified"
 import { logger } from "../../utils/logger"
 import { memoryDecayPrompts } from "./prompts"
+import { execFile } from "child_process"
+import { promisify } from "util"
+import { readFileSync } from "fs"
+import { resolve, dirname } from "path"
+import { fileURLToPath } from "url"
+
+const execFileAsync = promisify(execFile)
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000
 
@@ -45,10 +52,21 @@ export class MemoryDecayProvider implements Provider {
 
   private baseUrl = "http://localhost:8100"
   private cache = new Map<string, CachedQuestion>()
+  private useAgentMode = false
+
+  // Agent-based answer function: invokes Claude Code CLI
+  answerFunction?: (question: string, context: unknown[], questionDate?: string) => Promise<string>
 
   async initialize(config: ProviderConfig): Promise<void> {
     if (config.baseUrl) {
       this.baseUrl = config.baseUrl as string
+    }
+
+    // Enable agent mode with config flag: { agentMode: true }
+    if (config.agentMode) {
+      this.useAgentMode = true
+      this.answerFunction = this.agentAnswer.bind(this)
+      logger.info("[memory-decay] Agent mode enabled — answers will use Claude Code CLI")
     }
 
     try {
@@ -226,7 +244,7 @@ export class MemoryDecayProvider implements Provider {
       const res = await fetch(`${this.baseUrl}/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, top_k: options.limit || 20 }),
+        body: JSON.stringify({ query, top_k: options.limit || 30 }),
         signal: AbortSignal.timeout(30000),
       })
       if (!res.ok) return []
@@ -261,6 +279,93 @@ export class MemoryDecayProvider implements Provider {
 
   async clear(containerTag: string): Promise<void> {
     this.cache.delete(containerTag)
+  }
+
+  // --- Agent-based answer ---
+
+  private async agentAnswer(
+    question: string,
+    context: unknown[],
+    questionDate?: string
+  ): Promise<string> {
+    const results = context as Array<{
+      text: string
+      score: number
+      date?: string
+      speaker?: string
+      created_tick?: number
+    }>
+
+    // Format initial search results as conversation context
+    const formatted = results
+      .map((r, i) => {
+        const speaker = r.speaker || "Unknown"
+        const date = r.date || "unknown date"
+        return `[Memory ${i + 1}] (speaker: ${speaker}, date: ${date}, score: ${r.score?.toFixed(3) || "?"})\n${r.text}`
+      })
+      .join("\n\n")
+
+    const todayStr = questionDate || "unknown"
+
+    // Load the skill file
+    const skillPath = resolve(process.cwd(), "../memory-decay/skills/memory-retrieval/skill.md")
+    let skillContent = ""
+    try {
+      skillContent = readFileSync(skillPath, "utf8")
+    } catch {
+      // Try alternative paths
+      const altPaths = [
+        resolve(process.env.HOME || "~", "memory-decay/skills/memory-retrieval/skill.md"),
+        resolve(dirname(fileURLToPath(import.meta.url)), "../../../../memory-decay/skills/memory-retrieval/skill.md"),
+      ]
+      for (const p of altPaths) {
+        try {
+          skillContent = readFileSync(p, "utf8")
+          break
+        } catch {
+          continue
+        }
+      }
+    }
+
+    const prompt = `${skillContent ? skillContent + "\n\n---\n\n" : ""}Today's date: ${todayStr}
+Server URL: ${this.baseUrl}
+
+<previous_conversations>
+${formatted}
+</previous_conversations>
+
+Question: ${question}
+
+Answer the question using the memories above. If you need more context, search the memory-decay server at ${this.baseUrl} using curl. Give a concise, direct answer.`
+
+    try {
+      const { stdout } = await execFileAsync("claude", [
+        "-p", prompt,
+        "--output-format", "json",
+        "--allowedTools", "Bash",
+        "--max-turns", "10",
+        "--model", "sonnet",
+      ], {
+        timeout: 120_000,
+        env: { ...process.env },
+        maxBuffer: 10 * 1024 * 1024,
+      })
+
+      const response = JSON.parse(stdout)
+      const answer = response.result || response.text || ""
+
+      if (!answer) {
+        logger.warn(`[memory-decay] Agent returned empty answer for question: ${question.substring(0, 50)}`)
+        return "I don't know."
+      }
+
+      return answer.trim()
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e)
+      logger.error(`[memory-decay] Agent answer failed: ${error}`)
+      throw new Error(`Agent answer failed: ${error}`)
+    }
   }
 
   // --- Private helpers ---
