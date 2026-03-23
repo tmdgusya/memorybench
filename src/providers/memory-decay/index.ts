@@ -305,7 +305,24 @@ export class MemoryDecayProvider implements Provider {
       })
       .join("\n\n")
 
-    const todayStr = questionDate || "unknown"
+    // Infer "today" from the latest memory date if questionDate not provided.
+    // Benchmark data is from the past (e.g., 2023), so using the real system
+    // date (2026) would break all temporal reasoning.
+    let todayStr = questionDate
+    if (!todayStr) {
+      const dates = results
+        .map((r) => r.date)
+        .filter((d): d is string => !!d && d !== "unknown date")
+        .sort()
+      if (dates.length > 0) {
+        // Use the latest memory date + a small offset as "today"
+        const latest = new Date(dates[dates.length - 1])
+        latest.setDate(latest.getDate() + 30) // simulate 30 days after last memory
+        todayStr = latest.toISOString().slice(0, 10)
+      } else {
+        todayStr = "unknown"
+      }
+    }
 
     // Load the skill file
     const skillPath = resolve(process.cwd(), "../memory-decay/skills/memory-retrieval/skill.md")
