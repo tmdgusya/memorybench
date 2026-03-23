@@ -119,10 +119,15 @@ export async function runAnswerPhase(
         const questionDate = checkpoint.questions[question.questionId]?.questionDate
 
         let text: string
+        let agentMetrics: Record<string, unknown> | undefined
 
         if (provider?.answerFunction) {
           // Agent-based answer generation (e.g., Claude Code CLI)
-          text = await provider.answerFunction(question.question, context, questionDate)
+          const result = await provider.answerFunction(question.question, context, questionDate)
+          text = result.text
+          if (result.agentMetrics) {
+            agentMetrics = result.agentMetrics as unknown as Record<string, unknown>
+          }
         } else {
           const prompt = buildAnswerPrompt(question.question, context, questionDate, provider)
 
@@ -141,14 +146,21 @@ export async function runAnswerPhase(
         }
 
         const durationMs = Date.now() - startTime
-        checkpointManager.updatePhase(checkpoint, question.questionId, "answer", {
+        const phaseUpdate: Record<string, unknown> = {
           status: "completed",
           hypothesis: text.trim(),
           completedAt: new Date().toISOString(),
           durationMs,
-        })
+        }
+        if (agentMetrics) {
+          phaseUpdate.agentMetrics = agentMetrics
+        }
+        checkpointManager.updatePhase(checkpoint, question.questionId, "answer", phaseUpdate)
 
-        logger.progress(index + 1, total, `Answered ${question.questionId} (${durationMs}ms)`)
+        const metricsStr = agentMetrics
+          ? ` [${(agentMetrics as any).numTurns}t, ${(agentMetrics as any).inputTokens}in/${(agentMetrics as any).outputTokens}out, $${((agentMetrics as any).totalCostUsd || 0).toFixed(3)}]`
+          : ""
+        logger.progress(index + 1, total, `Answered ${question.questionId} (${durationMs}ms)${metricsStr}`)
         return { questionId: question.questionId, durationMs }
       } catch (e) {
         const error = e instanceof Error ? e.message : String(e)

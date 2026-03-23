@@ -118,7 +118,7 @@ export function generateReport(benchmark: Benchmark, checkpoint: RunCheckpoint):
 
     const retrievalMetrics = evalPhase.retrievalMetrics
 
-    evaluations.push({
+    const evaluation: Record<string, unknown> = {
       questionId: question.questionId,
       questionType: question.questionType,
       question: question.question,
@@ -132,7 +132,11 @@ export function generateReport(benchmark: Benchmark, checkpoint: RunCheckpoint):
       answerDurationMs,
       totalDurationMs,
       retrievalMetrics,
-    })
+    }
+    if ((answerPhase as any).agentMetrics) {
+      evaluation.agentMetrics = (answerPhase as any).agentMetrics
+    }
+    evaluations.push(evaluation as any)
 
     if (retrievalMetrics) {
       allRetrievalMetrics.push(retrievalMetrics)
@@ -189,6 +193,22 @@ export function generateReport(benchmark: Benchmark, checkpoint: RunCheckpoint):
   const correctCount = evaluations.filter((e) => e.score === 1).length
   const accuracy = totalQuestions > 0 ? correctCount / totalQuestions : 0
 
+  // Aggregate agent metrics if present
+  const agentEvals = evaluations.filter((e: any) => e.agentMetrics)
+  let agentSummary: Record<string, unknown> | undefined
+  if (agentEvals.length > 0) {
+    const metrics = agentEvals.map((e: any) => e.agentMetrics)
+    agentSummary = {
+      totalQuestions: agentEvals.length,
+      totalTurns: metrics.reduce((s: number, m: any) => s + m.numTurns, 0),
+      avgTurns: metrics.reduce((s: number, m: any) => s + m.numTurns, 0) / metrics.length,
+      totalInputTokens: metrics.reduce((s: number, m: any) => s + m.inputTokens, 0),
+      totalOutputTokens: metrics.reduce((s: number, m: any) => s + m.outputTokens, 0),
+      totalCostUsd: metrics.reduce((s: number, m: any) => s + m.totalCostUsd, 0),
+      avgCostPerQuestion: metrics.reduce((s: number, m: any) => s + m.totalCostUsd, 0) / metrics.length,
+    }
+  }
+
   const result: BenchmarkResult = {
     provider: checkpoint.provider,
     benchmark: checkpoint.benchmark,
@@ -214,6 +234,7 @@ export function generateReport(benchmark: Benchmark, checkpoint: RunCheckpoint):
     byQuestionType,
     questionTypeRegistry: benchmark.getQuestionTypes(),
     evaluations,
+    ...(agentSummary ? { agentSummary } : {}),
   }
 
   return result
@@ -291,5 +312,17 @@ export function printReport(result: BenchmarkResult): void {
       )
     }
   }
+
+  if (result.agentSummary) {
+    console.log("-".repeat(60))
+    console.log("\nAGENT METRICS:")
+    console.log(`  Questions:    ${result.agentSummary.totalQuestions}`)
+    console.log(`  Total Turns:  ${result.agentSummary.totalTurns} (avg ${result.agentSummary.avgTurns.toFixed(1)}/q)`)
+    console.log(`  Input Tokens: ${result.agentSummary.totalInputTokens.toLocaleString()}`)
+    console.log(`  Output Tokens:${result.agentSummary.totalOutputTokens.toLocaleString()}`)
+    console.log(`  Total Cost:   $${result.agentSummary.totalCostUsd.toFixed(4)}`)
+    console.log(`  Avg Cost/Q:   $${result.agentSummary.avgCostPerQuestion.toFixed(4)}`)
+  }
+
   console.log("=".repeat(60) + "\n")
 }

@@ -32,6 +32,17 @@ export interface IndexingProgress {
 
 export type IndexingProgressCallback = (progress: IndexingProgress) => void
 
+export interface AnswerResult {
+  text: string
+  agentMetrics?: {
+    numTurns: number
+    inputTokens: number
+    outputTokens: number
+    totalCostUsd: number
+    durationMs: number
+  }
+}
+
 export interface Provider {
   name: string
   prompts?: ProviderPrompts
@@ -55,7 +66,7 @@ export interface Provider {
     question: string,
     context: unknown[],
     questionDate?: string
-  ) => Promise<string>
+  ) => Promise<AnswerResult>
 }
 
 export type ProviderName = "supermemory" | "mem0" | "zep" | "filesystem" | "rag" | "memory-decay"

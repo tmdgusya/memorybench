@@ -5,6 +5,7 @@ import type {
   IngestResult,
   SearchOptions,
   IndexingProgressCallback,
+  AnswerResult,
 } from "../../types/provider"
 import type { ProviderPrompts } from "../../types/prompts"
 import type { UnifiedSession } from "../../types/unified"
@@ -55,7 +56,7 @@ export class MemoryDecayProvider implements Provider {
   private useAgentMode = false
 
   // Agent-based answer function: invokes Claude Code CLI
-  answerFunction?: (question: string, context: unknown[], questionDate?: string) => Promise<string>
+  answerFunction?: (question: string, context: unknown[], questionDate?: string) => Promise<AnswerResult>
 
   async initialize(config: ProviderConfig): Promise<void> {
     if (config.baseUrl) {
@@ -287,7 +288,7 @@ export class MemoryDecayProvider implements Provider {
     question: string,
     context: unknown[],
     questionDate?: string
-  ): Promise<string> {
+  ): Promise<AnswerResult> {
     const results = context as Array<{
       text: string
       score: number
@@ -374,10 +375,25 @@ Answer the question using the memories above. If you need more context, search t
 
       if (!answer) {
         logger.warn(`[memory-decay] Agent returned empty answer for question: ${question.substring(0, 50)}`)
-        return "I don't know."
+        return { text: "I don't know." }
       }
 
-      return answer.trim()
+      const usage = response.usage || {}
+      const agentMetrics = {
+        numTurns: response.num_turns || 1,
+        inputTokens: (usage.input_tokens || 0) + (usage.cache_read_input_tokens || 0) + (usage.cache_creation_input_tokens || 0),
+        outputTokens: usage.output_tokens || 0,
+        totalCostUsd: response.total_cost_usd || 0,
+        durationMs: response.duration_ms || 0,
+      }
+
+      logger.debug(
+        `[memory-decay] Agent: ${agentMetrics.numTurns} turns, ` +
+        `${agentMetrics.inputTokens}in/${agentMetrics.outputTokens}out tokens, ` +
+        `$${agentMetrics.totalCostUsd.toFixed(4)}`
+      )
+
+      return { text: answer.trim(), agentMetrics }
     } catch (e) {
       const error = e instanceof Error ? e.message : String(e)
       logger.error(`[memory-decay] Agent answer failed: ${error}`)

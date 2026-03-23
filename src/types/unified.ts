@@ -116,4 +116,13 @@ export interface BenchmarkResult {
   byQuestionType: Record<string, QuestionTypeStats>
   questionTypeRegistry?: QuestionTypeRegistry
   evaluations: EvaluationResult[]
+  agentSummary?: {
+    totalQuestions: number
+    totalTurns: number
+    avgTurns: number
+    totalInputTokens: number
+    totalOutputTokens: number
+    totalCostUsd: number
+    avgCostPerQuestion: number
+  }
 }
