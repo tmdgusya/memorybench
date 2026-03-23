@@ -18,6 +18,7 @@ interface CachedMessage {
   importance: number
   created_tick: number
   sessionDateMs: number
+  speaker: string
 }
 
 interface CachedQuestion {
@@ -81,6 +82,7 @@ export class MemoryDecayProvider implements Provider {
       messages: [],
       sessionDatesMs: [] as number[],
     }
+    const startIndex = existing.messages.length
 
     const sessionDates = this.extractSessionDates(sessions)
 
@@ -92,21 +94,27 @@ export class MemoryDecayProvider implements Provider {
 
       for (const msg of session.messages) {
         const importance = msg.role === "user" ? 0.7 : 0.4
+        const speaker = msg.speaker || (msg.role === "user" ? "User" : "Assistant")
+
+        // Keep original [User]/[Assistant] prefix to preserve embedding cache;
+        // speaker name and date travel as metadata for the answer LLM
         const prefix = msg.role === "user" ? "[User]" : "[Assistant]"
+
         existing.messages.push({
           text: `${prefix} ${msg.content}`,
           importance,
           created_tick: 0, // will be recomputed in finalizeCache()
           sessionDateMs,
+          speaker,
         })
       }
     }
 
     this.cache.set(options.containerTag, existing)
 
-    const documentIds = existing.messages.map(
-      (_, i) => `${options.containerTag}_${i}`
-    )
+    const documentIds = existing.messages
+      .slice(startIndex)
+      .map((_, i) => `${options.containerTag}_${startIndex + i}`)
 
     logger.debug(
       `Cached ${existing.messages.length} messages (${sessions.length} new sessions) for ${options.containerTag}`
@@ -159,22 +167,44 @@ export class MemoryDecayProvider implements Provider {
     // Reset → ingest → simulate → search (per-question isolation)
     await fetch(`${this.baseUrl}/reset`, { method: "POST" })
 
-    // Ingest all cached messages
-    for (const msg of cached.messages) {
-      try {
-        await fetch(`${this.baseUrl}/store`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            text: msg.text,
-            importance: msg.importance,
-            mtype: "episode",
-            created_tick: msg.created_tick,
-          }),
-          signal: AbortSignal.timeout(30000),
-        })
-      } catch (e) {
-        logger.warn(`[memory-decay] /store error during search: ${e}`)
+    // Hybrid storage: individual messages + session chunks (≥15 messages only).
+    // Chunks help LoCoMo (long dialogues) without flooding LongMemEval (shorter sessions).
+    const individualItems = cached.messages.map((msg) => ({
+      text: msg.text,
+      importance: msg.importance,
+      mtype: "episode" as const,
+      created_tick: msg.created_tick,
+      speaker: msg.speaker,
+    }))
+
+    const sessionChunks = this.buildSessionChunks(cached.messages)
+    const meaningfulChunks = sessionChunks.filter((c) => c.text.includes("\n"))
+    const batchPayload = [...individualItems, ...meaningfulChunks]
+
+    logger.debug(
+      `[memory-decay] Hybrid: ${individualItems.length} individual + ${meaningfulChunks.length} chunks = ${batchPayload.length} total`
+    )
+
+    try {
+      await fetch(`${this.baseUrl}/store-batch`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(sessionChunks),
+        signal: AbortSignal.timeout(120000),
+      })
+    } catch (e) {
+      logger.warn(`[memory-decay] /store-batch error: ${e}, falling back to individual stores`)
+      for (const item of sessionChunks) {
+        try {
+          await fetch(`${this.baseUrl}/store`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(item),
+            signal: AbortSignal.timeout(30000),
+          })
+        } catch (e2) {
+          logger.warn(`[memory-decay] /store fallback error: ${e2}`)
+        }
       }
     }
 
@@ -196,22 +226,34 @@ export class MemoryDecayProvider implements Provider {
       const res = await fetch(`${this.baseUrl}/search`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ query, top_k: options.limit || 7 }),
+        body: JSON.stringify({ query, top_k: options.limit || 20 }),
         signal: AbortSignal.timeout(30000),
       })
       if (!res.ok) return []
-      const data = (await res.json()) as { results: Array<{ text: string; score: number }> }
+      const data = (await res.json()) as {
+        results: Array<{ text: string; score: number; created_tick: number; speaker?: string; [k: string]: unknown }>
+      }
+      // Ignore framework threshold — score ranges vary by embedding model,
+      // and the server already returns top_k ranked results
+      const filteredResults = data.results
+
+      // Enrich results with computed calendar date from tick mapping
+      const enriched = filteredResults.map((r) => {
+        const dateMs = earliestMs > 0 ? earliestMs + r.created_tick * ONE_DAY_MS : 0
+        const date = dateMs > 0 ? new Date(dateMs).toISOString().slice(0, 10) : ""
+        return { ...r, date }
+      })
 
       // Log token efficiency
-      const totalChars = data.results.reduce((sum, r) => sum + (r.text?.length || 0), 0)
+      const totalChars = enriched.reduce((sum, r) => sum + (r.text?.length || 0), 0)
       const estTokens = Math.ceil(totalChars / 4)
       logger.debug(
         `[memory-decay] Search for "${query.substring(0, 40)}...": ` +
-          `${data.results.length} results, ~${estTokens} context tokens ` +
+          `${enriched.length} results, ~${estTokens} context tokens ` +
           `(from ${cached.messages.length} total memories)`
       )
 
-      return data.results
+      return enriched
     } catch {
       return []
     }
@@ -222,6 +264,71 @@ export class MemoryDecayProvider implements Provider {
   }
 
   // --- Private helpers ---
+
+  private buildSessionChunks(
+    messages: CachedMessage[]
+  ): Array<{ text: string; importance: number; mtype: string; created_tick: number; speaker: string }> {
+    // Adaptive chunking: group by session, but split large sessions
+    // and keep short sessions as individual messages.
+    //
+    // - Sessions with ≥ 5 messages: chunk into session transcript
+    // - Sessions with < 5 messages: keep as individual messages
+    //   (short sessions lack enough context for meaningful chunks,
+    //    and LongMemEval has many short sessions where chunking hurts)
+
+    const MIN_CHUNK_SIZE = 15
+
+    const sessionMap = new Map<number, CachedMessage[]>()
+    for (const msg of messages) {
+      const key = msg.sessionDateMs
+      if (!sessionMap.has(key)) sessionMap.set(key, [])
+      sessionMap.get(key)!.push(msg)
+    }
+
+    type ChunkItem = { text: string; importance: number; mtype: string; created_tick: number; speaker: string }
+    const chunks: ChunkItem[] = []
+
+    for (const [, sessionMsgs] of sessionMap) {
+      // Skip chunking for undated sessions (sessionDateMs=0, e.g., ConvoMem)
+      // — all messages share the same key, creating one giant unusable chunk
+      const sessionDateMs = sessionMsgs[0].sessionDateMs
+      if (sessionMsgs.length < MIN_CHUNK_SIZE || sessionDateMs === 0) {
+        // Keep as individual messages (original format)
+        for (const m of sessionMsgs) {
+          chunks.push({
+            text: m.text,
+            importance: m.importance,
+            mtype: "episode",
+            created_tick: m.created_tick,
+            speaker: m.speaker,
+          })
+        }
+      } else {
+        // Chunk into session transcript
+        const lines = sessionMsgs.map((m) => `${m.speaker}: ${m.text.replace(/^\[(User|Assistant)\]\s*/, "")}`)
+        const chunkText = lines.join("\n")
+
+        const maxImportance = Math.max(...sessionMsgs.map((m) => m.importance))
+        const tick = sessionMsgs[0].created_tick
+
+        const speakerCounts = new Map<string, number>()
+        for (const m of sessionMsgs) {
+          speakerCounts.set(m.speaker, (speakerCounts.get(m.speaker) || 0) + 1)
+        }
+        const primarySpeaker = [...speakerCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || ""
+
+        chunks.push({
+          text: chunkText,
+          importance: maxImportance,
+          mtype: "episode",
+          created_tick: tick,
+          speaker: primarySpeaker,
+        })
+      }
+    }
+
+    return chunks
+  }
 
   private extractSessionDates(sessions: UnifiedSession[]): Date[] {
     return sessions.map((session) => {
