@@ -35,6 +35,7 @@ export function getProviderConfig(provider: string): { apiKey: string; baseUrl?:
         apiKey: "",
         baseUrl: process.env.MEMORY_DECAY_BASE_URL || "http://localhost:8100",
         agentMode: process.env.MEMORY_DECAY_AGENT_MODE === "1",
+        directMode: process.env.MEMORY_DECAY_DIRECT_MODE === "1",
       }
     default:
       throw new Error(`Unknown provider: ${provider}`)

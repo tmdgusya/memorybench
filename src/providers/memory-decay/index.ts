@@ -13,7 +13,7 @@ import { logger } from "../../utils/logger"
 import { memoryDecayPrompts } from "./prompts"
 import { execFile } from "child_process"
 import { promisify } from "util"
-import { readFileSync } from "fs"
+import { readFileSync, existsSync, mkdirSync, writeFileSync } from "fs"
 import { resolve, dirname } from "path"
 import { fileURLToPath } from "url"
 
@@ -54,6 +54,10 @@ export class MemoryDecayProvider implements Provider {
   private baseUrl = "http://localhost:8100"
   private cache = new Map<string, CachedQuestion>()
   private useAgentMode = false
+  private useDirectMode = false
+  private experimentDir = ""
+  private pythonPath = "/Users/lit/memory-decay/.venv/bin/python"
+  private static readonly BENCH_TMP_DIR = "/tmp/memorybench"
 
   // Agent-based answer function: invokes Claude Code CLI
   answerFunction?: (question: string, context: unknown[], questionDate?: string) => Promise<AnswerResult>
@@ -68,6 +72,26 @@ export class MemoryDecayProvider implements Provider {
       this.useAgentMode = true
       this.answerFunction = this.agentAnswer.bind(this)
       logger.info("[memory-decay] Agent mode enabled — answers will use Claude Code CLI")
+    }
+
+    // Enable direct mode (bench_bridge via SQLite, no HTTP server needed)
+    if (config.directMode) {
+      this.useDirectMode = true
+      this.experimentDir = process.env.MEMORY_DECAY_EXPERIMENT_DIR || ""
+      if (!this.experimentDir) {
+        throw new Error(
+          "[memory-decay] Direct mode requires MEMORY_DECAY_EXPERIMENT_DIR env var " +
+          "(path to experiment directory containing params.json)"
+        )
+      }
+      // Ensure tmp directory exists
+      if (!existsSync(MemoryDecayProvider.BENCH_TMP_DIR)) {
+        mkdirSync(MemoryDecayProvider.BENCH_TMP_DIR, { recursive: true })
+      }
+      logger.info(
+        `[memory-decay] Direct mode enabled — using bench_bridge with experiment dir: ${this.experimentDir}`
+      )
+      return // Skip HTTP health check
     }
 
     try {
@@ -183,6 +207,11 @@ export class MemoryDecayProvider implements Provider {
         ? Math.max(1, Math.floor((latestMs - earliestMs) / ONE_DAY_MS) + 30)
         : 30
 
+    // Direct mode: use bench_bridge (SQLite) instead of HTTP server
+    if (this.useDirectMode) {
+      return this.searchDirect(query, options, cached, earliestMs, simulateTicks)
+    }
+
     // Reset → ingest → simulate → search (per-question isolation)
     await fetch(`${this.baseUrl}/reset`, { method: "POST" })
 
@@ -274,6 +303,124 @@ export class MemoryDecayProvider implements Provider {
 
       return enriched
     } catch {
+      return []
+    }
+  }
+
+  /**
+   * Direct mode search: uses bench_bridge (Python CLI → SQLite) instead of HTTP server.
+   * The prepare action is idempotent — if the DB already has memories, it skips re-ingestion.
+   */
+  private async searchDirect(
+    query: string,
+    options: SearchOptions,
+    cached: CachedQuestion,
+    earliestMs: number,
+    simulateTicks: number
+  ): Promise<unknown[]> {
+    const containerTag = options.containerTag
+    const dbPath = resolve(MemoryDecayProvider.BENCH_TMP_DIR, `${containerTag}.db`)
+    const messagesFile = resolve(MemoryDecayProvider.BENCH_TMP_DIR, `${containerTag}_messages.json`)
+    const paramsFile = resolve(this.experimentDir, "params.json")
+    const cachDbPath = resolve(MemoryDecayProvider.BENCH_TMP_DIR, "embedding_cache.db")
+    const openaiApiKey = process.env.OPENAI_API_KEY || ""
+
+    // Build messages for bench_bridge
+    const sessionChunks = this.buildSessionChunks(cached.messages)
+    const bridgeMessages = sessionChunks.map((item) => ({
+      text: item.text,
+      importance: item.importance,
+      mtype: item.mtype,
+      created_tick: item.created_tick,
+      speaker: item.speaker,
+    }))
+
+    // Step 1: Prepare (write messages + call bench_bridge prepare)
+    // bench_bridge is idempotent — if DB exists with memories, it returns {cached: true}
+    if (!existsSync(dbPath)) {
+      writeFileSync(messagesFile, JSON.stringify(bridgeMessages))
+
+      const prepareArgs = [
+        "-m", "memory_decay.bench_bridge",
+        "--action", "prepare",
+        "--db-path", dbPath,
+        "--messages-file", messagesFile,
+        "--params-file", paramsFile,
+        "--embedding-provider", "openai",
+        "--embedding-api-key", openaiApiKey,
+        "--embedding-model", "text-embedding-3-large",
+        "--cache-db-path", cachDbPath,
+        "--simulate-ticks", String(simulateTicks),
+      ]
+
+      try {
+        const { stdout, stderr } = await execFileAsync(this.pythonPath, prepareArgs, {
+          timeout: 300_000,
+          env: { ...process.env },
+          maxBuffer: 50 * 1024 * 1024,
+        })
+        const prepResult = JSON.parse(stdout)
+        logger.debug(
+          `[memory-decay] Direct prepare ${containerTag}: ${prepResult.cached ? "cached" : "built"}, ` +
+          `${bridgeMessages.length} messages, ${simulateTicks} ticks`
+        )
+        if (stderr) {
+          logger.debug(`[memory-decay] Direct prepare stderr: ${stderr.substring(0, 200)}`)
+        }
+      } catch (e) {
+        const error = e instanceof Error ? e.message : String(e)
+        logger.error(`[memory-decay] Direct prepare failed for ${containerTag}: ${error}`)
+        return []
+      }
+    } else {
+      logger.debug(`[memory-decay] Direct prepare ${containerTag}: DB already exists, skipping`)
+    }
+
+    // Step 2: Search
+    const searchArgs = [
+      "-m", "memory_decay.bench_bridge",
+      "--action", "search",
+      "--db-path", dbPath,
+      "--query", query,
+      "--top-k", String(options.limit || 30),
+      "--embedding-provider", "openai",
+      "--embedding-api-key", openaiApiKey,
+      "--embedding-model", "text-embedding-3-large",
+      "--cache-db-path", cachDbPath,
+      "--params-file", paramsFile,
+    ]
+
+    try {
+      const { stdout } = await execFileAsync(this.pythonPath, searchArgs, {
+        timeout: 60_000,
+        env: { ...process.env },
+        maxBuffer: 10 * 1024 * 1024,
+      })
+
+      const data = JSON.parse(stdout) as {
+        results: Array<{ text: string; score: number; created_tick: number; speaker?: string; [k: string]: unknown }>
+      }
+
+      // Enrich results with computed calendar date from tick mapping
+      const enriched = data.results.map((r) => {
+        const dateMs = earliestMs > 0 ? earliestMs + r.created_tick * ONE_DAY_MS : 0
+        const date = dateMs > 0 ? new Date(dateMs).toISOString().slice(0, 10) : ""
+        return { ...r, date }
+      })
+
+      // Log token efficiency
+      const totalChars = enriched.reduce((sum, r) => sum + (r.text?.length || 0), 0)
+      const estTokens = Math.ceil(totalChars / 4)
+      logger.debug(
+        `[memory-decay] Direct search for "${query.substring(0, 40)}...": ` +
+          `${enriched.length} results, ~${estTokens} context tokens ` +
+          `(from ${cached.messages.length} total memories)`
+      )
+
+      return enriched
+    } catch (e) {
+      const error = e instanceof Error ? e.message : String(e)
+      logger.error(`[memory-decay] Direct search failed: ${error}`)
       return []
     }
   }
