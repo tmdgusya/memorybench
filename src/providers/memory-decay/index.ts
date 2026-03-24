@@ -455,9 +455,8 @@ export class MemoryDecayProvider implements Provider {
       })
       .join("\n\n")
 
-    // Infer "today" from the latest memory date if questionDate not provided.
-    // Benchmark data is from the past (e.g., 2023), so using the real system
-    // date (2026) would break all temporal reasoning.
+    // Use questionDate if provided (LongMemEval provides this).
+    // Fallback: infer from latest memory date (last resort, less accurate).
     let todayStr = questionDate
     if (!todayStr) {
       const dates = results
@@ -465,10 +464,7 @@ export class MemoryDecayProvider implements Provider {
         .filter((d): d is string => !!d && d !== "unknown date")
         .sort()
       if (dates.length > 0) {
-        // Use the latest memory date + a small offset as "today"
-        const latest = new Date(dates[dates.length - 1])
-        latest.setDate(latest.getDate() + 30) // simulate 30 days after last memory
-        todayStr = latest.toISOString().slice(0, 10)
+        todayStr = dates[dates.length - 1]
       } else {
         todayStr = "unknown"
       }
