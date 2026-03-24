@@ -55,6 +55,7 @@ export class MemoryDecayProvider implements Provider {
   private cache = new Map<string, CachedQuestion>()
   private useAgentMode = false
   private useDirectMode = false
+  private lastDirectDbPath = ""
   private experimentDir = ""
   private pythonPath = "/Users/lit/memory-decay/.venv/bin/python"
   private static readonly BENCH_TMP_DIR = "/tmp/memorybench"
@@ -320,6 +321,7 @@ export class MemoryDecayProvider implements Provider {
   ): Promise<unknown[]> {
     const containerTag = options.containerTag
     const dbPath = resolve(MemoryDecayProvider.BENCH_TMP_DIR, `${containerTag}.db`)
+    this.lastDirectDbPath = dbPath
     const messagesFile = resolve(MemoryDecayProvider.BENCH_TMP_DIR, `${containerTag}_messages.json`)
     const paramsFile = resolve(this.experimentDir, "params.json")
     const cachDbPath = resolve(MemoryDecayProvider.BENCH_TMP_DIR, "embedding_cache.db")
@@ -493,12 +495,25 @@ export class MemoryDecayProvider implements Provider {
       }
     }
 
+    // Build search instruction based on mode
+    let searchInstruction: string
+    if (this.useDirectMode && this.lastDirectDbPath) {
+      // Direct mode: agent uses bench_bridge CLI for re-searches (no server needed)
+      const openaiKey = process.env.OPENAI_API_KEY || ""
+      const cachDbPath = resolve(MemoryDecayProvider.BENCH_TMP_DIR, "embedding_cache.db")
+      const paramsFile = this.experimentDir ? resolve(this.experimentDir, "params.json") : ""
+      searchInstruction = `- To search for additional memories, run:
+  ${this.pythonPath} -m memory_decay.bench_bridge --action search --db-path "${this.lastDirectDbPath}" --query "YOUR QUERY" --top-k 20 --embedding-provider openai --embedding-api-key "${openaiKey}" --embedding-model text-embedding-3-large --cache-db-path "${cachDbPath}" ${paramsFile ? `--params-file "${paramsFile}"` : ""}`
+    } else {
+      searchInstruction = `- Memory server URL: ${this.baseUrl}
+- To search: curl -s ${this.baseUrl}/search -H "Content-Type: application/json" -d '{"query": "...", "top_k": 20}'`
+    }
+
     const systemPrompt = `${skillContent}
 
 CRITICAL CONTEXT:
 - Today's date is ${todayStr}. You MUST use this date for all temporal calculations. Do NOT use your system clock.
-- Memory server URL: ${this.baseUrl}
-- To search: curl -s ${this.baseUrl}/search -H "Content-Type: application/json" -d '{"query": "...", "top_k": 20}'`
+${searchInstruction}`
 
     const prompt = `<previous_conversations>
 ${formatted}
