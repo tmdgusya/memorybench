@@ -346,16 +346,21 @@ export class MemoryDecayProvider implements Provider {
       }
     }
 
-    const prompt = `${skillContent ? skillContent + "\n\n---\n\n" : ""}Today's date: ${todayStr}
-Server URL: ${this.baseUrl}
+    const systemPrompt = `${skillContent}
 
-<previous_conversations>
+CRITICAL CONTEXT:
+- Today's date is ${todayStr}. You MUST use this date for all temporal calculations. Do NOT use your system clock.
+- Memory server URL: ${this.baseUrl}
+- To search: curl -s ${this.baseUrl}/search -H "Content-Type: application/json" -d '{"query": "...", "top_k": 20}'`
+
+    const prompt = `<previous_conversations>
 ${formatted}
 </previous_conversations>
 
 Question: ${question}
 
-Answer the question using the memories above. If you need more context, search the memory-decay server at ${this.baseUrl} using curl. Give a concise, direct answer.`
+Today's date: ${todayStr}
+Answer the question. If the provided memories are insufficient, search the server for more context. Be concise and direct.`
 
     try {
       const { stdout } = await execFileAsync("claude", [
@@ -364,6 +369,7 @@ Answer the question using the memories above. If you need more context, search t
         "--allowedTools", "Bash",
         "--max-turns", "10",
         "--model", "sonnet",
+        "--append-system-prompt", systemPrompt,
       ], {
         timeout: 120_000,
         env: { ...process.env },
